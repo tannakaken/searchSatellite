@@ -1,5 +1,8 @@
+#include <stdlib.h>
 #include <Camera.h>
 #include <SDHCI.h>
+#include <GNSS.h>
+#include <MPMutex.h>
 // https://github.com/TE-YoshinoriOota/Spresense-LowPower-EdgeAI/tree/main/Libraries からzipをダウンロードしてarduion IDEの機能でインストールする
 #include "Adafruit_ILI9341.h"
 
@@ -9,7 +12,197 @@
 #define TFT_DC 9
 #define TFT_CS 10
 
+// GPS setting
+#define STRING_BUFFER_SIZE  128       /**< %Buffer size */
+
+#define RESTART_CYCLE       (60 * 5)  /**< positioning test term */
+
+static SpGnss Gnss;                   /**< SpGnss object */
+
+/**
+ * @enum ParamSat
+ * @brief Satellite system
+ */
+enum ParamSat {
+  eSatGps,            /**< GPS                     World wide coverage  */
+  eSatGlonass,        /**< GLONASS                 World wide coverage  */
+  eSatGpsSbas,        /**< GPS+SBAS                North America        */
+  eSatGpsGlonass,     /**< GPS+Glonass             World wide coverage  */
+  eSatGpsBeidou,      /**< GPS+BeiDou              World wide coverage  */
+  eSatGpsGalileo,     /**< GPS+Galileo             World wide coverage  */
+  eSatGpsQz1c,        /**< GPS+QZSS_L1CA           East Asia & Oceania  */
+  eSatGpsGlonassQz1c, /**< GPS+Glonass+QZSS_L1CA   East Asia & Oceania  */
+  eSatGpsBeidouQz1c,  /**< GPS+BeiDou+QZSS_L1CA    East Asia & Oceania  */
+  eSatGpsGalileoQz1c, /**< GPS+Galileo+QZSS_L1CA   East Asia & Oceania  */
+  eSatGpsQz1cQz1S,    /**< GPS+QZSS_L1CA+QZSS_L1S  Japan                */
+};
+
+/* Set this parameter depending on your current region. */
+static enum ParamSat satType =  eSatGps;
+
+static void init_gps() {
+  int error_flag = 0;
+  /* Activate GNSS device */
+  int result = Gnss.begin();
+  if (result != 0)
+  {
+    Serial.println("Gnss begin error!!");
+    error_flag = 1;
+  }
+  else
+  {
+    /* Setup GNSS
+     *  It is possible to setup up to two GNSS satellites systems.
+     *  Depending on your location you can improve your accuracy by selecting different GNSS system than the GPS system.
+     *  See: https://developer.sony.com/develop/spresense/developer-tools/get-started-using-nuttx/nuttx-developer-guide#_gnss
+     *  for detailed information.
+    */
+    switch (satType)
+    {
+    case eSatGps:
+      Gnss.select(GPS);
+      break;
+
+    case eSatGpsSbas:
+      Gnss.select(GPS);
+      Gnss.select(SBAS);
+      break;
+
+    case eSatGlonass:
+      Gnss.select(GLONASS);
+      break;
+
+    case eSatGpsGlonass:
+      Gnss.select(GPS);
+      Gnss.select(GLONASS);
+      break;
+
+    case eSatGpsBeidou:
+      Gnss.select(GPS);
+      Gnss.select(BEIDOU);
+      break;
+
+    case eSatGpsGalileo:
+      Gnss.select(GPS);
+      Gnss.select(GALILEO);
+      break;
+
+    case eSatGpsQz1c:
+      Gnss.select(GPS);
+      Gnss.select(QZ_L1CA);
+      break;
+
+    case eSatGpsQz1cQz1S:
+      Gnss.select(GPS);
+      Gnss.select(QZ_L1CA);
+      Gnss.select(QZ_L1S);
+      break;
+
+    case eSatGpsBeidouQz1c:
+      Gnss.select(GPS);
+      Gnss.select(BEIDOU);
+      Gnss.select(QZ_L1CA);
+      break;
+
+    case eSatGpsGalileoQz1c:
+      Gnss.select(GPS);
+      Gnss.select(GALILEO);
+      Gnss.select(QZ_L1CA);
+      break;
+
+    case eSatGpsGlonassQz1c:
+    default:
+      Gnss.select(GPS);
+      Gnss.select(GLONASS);
+      Gnss.select(QZ_L1CA);
+      break;
+    }
+    /* Start positioning */
+    result = Gnss.start(COLD_START);
+    if (result != 0)
+    {
+      Serial.println("Gnss start error!!");
+      error_flag = 1;
+    }
+  }
+}
+
+/**
+ * @brief %Print position information.
+ */
+static void print_pos(SpNavData *pNavData)
+{
+  char StringBuffer[STRING_BUFFER_SIZE];
+
+  /* print time */
+  snprintf(StringBuffer, STRING_BUFFER_SIZE, "%04d/%02d/%02d ", pNavData->time.year, pNavData->time.month, pNavData->time.day);
+  Serial.print(StringBuffer);
+
+  snprintf(StringBuffer, STRING_BUFFER_SIZE, "%02d:%02d:%02d.%06ld, ", pNavData->time.hour, pNavData->time.minute, pNavData->time.sec, pNavData->time.usec);
+  Serial.print(StringBuffer);
+
+  /* print satellites count */
+  snprintf(StringBuffer, STRING_BUFFER_SIZE, "numSat:%2d, ", pNavData->numSatellites);
+  Serial.print(StringBuffer);
+
+  /* print position data */
+  if (pNavData->posFixMode == FixInvalid)
+  {
+    Serial.print("No-Fix, ");
+  }
+  else
+  {
+    Serial.print("Fix, ");
+  }
+  if (pNavData->posDataExist == 0)
+  {
+    Serial.print("No Position");
+  }
+  else
+  {
+    Serial.print("Lat=");
+    Serial.print(pNavData->latitude, 6);
+    Serial.print(", Lon=");
+    Serial.print(pNavData->longitude, 6);
+  }
+
+  Serial.println("");
+}
+
+// display setting
 Adafruit_ILI9341 display = Adafruit_ILI9341(TFT_CS, TFT_DC);
+
+// base64 util
+const uint8_t base64Table[65] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/**
+ * https://gist.github.com/ksasao/89b2b83df153386026ea69d813fd584e
+ */
+void base64EncodeSerialWrite(uint8_t* data, size_t dataLength){
+  while (dataLength > 0) {
+    if (dataLength >= 3) {
+      Serial.write(base64Table[data[0] >> 2]);
+      Serial.write(base64Table[((data[0]&0x3) << 4) | (data[1] >> 4)]);
+      Serial.write(base64Table[((data[1]&0xF) << 2) | (data[2] >> 6)]);
+      Serial.write(base64Table[data[2] & 0x3F]);
+      data += 3;
+      dataLength -= 3;
+    } else if (dataLength == 2) {
+      Serial.write(base64Table[data[0] >> 2]);
+      Serial.write(base64Table[((data[0]&0x3) << 4) | (data[1] >> 4)]);
+      Serial.write(base64Table[(data[1]&0xF) << 2]);
+      Serial.write('=');
+      dataLength = 0;
+    } else {
+      Serial.write(base64Table[data[0] >> 2]);
+      Serial.write(base64Table[(data[0]&0x3) << 4]);
+      Serial.write('=');
+      Serial.write('=');
+      dataLength = 0;
+    }
+  }
+  Serial.write('\n');
+  Serial.flush();
+}
 
 SDClass SD;
 
@@ -52,24 +245,26 @@ void printCameraError(enum CamErr err) {
     }
 }
 
-char fname[16] = {0};
-
+// CamImage savedImg; これ二つあるとなぜかうまくいかない。
+uint8_t *savedBuff = NULL;
+size_t savedSize;
+MPMutex sendingSerialMutex(MP_MUTEX_ID0);
 void takePhoto() {
-  static int g_counter = 0;
-  sprintf(fname, "%03d.jpg", g_counter);
-  if (SD.exists(fname)) {
-    SD.remove(fname);
+  if (sendingSerialMutex.Trylock() != 0) {
+    return;
   }
-  File imageFile = SD.open(fname, FILE_WRITE);
   CamImage img = theCamera.takePicture();
-  if (img.isAvailable()) {
-    imageFile.write(img.getImgBuff(), img.getImgSize());
-    imageFile.close();
-    Serial.println("Saved an image as " + String(fname));
-  } else {
-    Serial.println("Camera is not available");
+  if (!img.isAvailable() && img.getImgSize() == 0) {
+    Serial.println("Image is not available");
+    return;
   }
-  ++g_counter;
+  if (savedBuff != NULL) {
+    free(savedBuff);
+  }
+  savedSize = img.getImgSize();
+  savedBuff = malloc(sizeof(uint8_t) * savedSize);
+  memcpy(savedBuff, img.getImgBuff(), sizeof(uint8_t) * savedSize);
+  sendingSerialMutex.Unlock();
 }
 
 #define PIXEL_THRESHOLD 150
@@ -87,12 +282,10 @@ void CamCB(CamImage img) {
   bool success;
   success = getOffsetXAndWidthOfRegion(yuvImageBuff, PIXEL_THRESHOLD, &offsetX, &widthOfRegion);
   if (!success) {
-    Serial.println("x detection error");
     goto result;
   }
   success = getOffsetYAndHeightOfRegion(yuvImageBuff, PIXEL_THRESHOLD, &offsetY, &heightOfRegion);
   if (!success) {
-    Serial.println("y detection error");
     goto result;
   }
   
@@ -100,16 +293,10 @@ result:
   img.convertPixFormat(CAM_IMAGE_PIX_FMT_RGB565);
   uint16_t *rgbImageBuff = (uint16_t *)img.getImgBuff();
   if (success && widthOfRegion * heightOfRegion > SQUARE_SIZE_THRESHOLD) {
-    digitalWrite(LED0, HIGH);
-    digitalWrite(LED1, HIGH);
-    digitalWrite(LED2, HIGH);
     digitalWrite(LED3, HIGH);
     drawBox(rgbImageBuff, offsetX, offsetY, widthOfRegion, heightOfRegion, 2, ILI9341_RED);
     takePhoto();
   } else {
-    digitalWrite(LED0, LOW);
-    digitalWrite(LED1, LOW);
-    digitalWrite(LED2, LOW);
     digitalWrite(LED3, LOW);
   }
   display.drawRGBBitmap(0, 0, rgbImageBuff, CAMERA_WIDTH, CAMERA_HEIGHT);
@@ -127,15 +314,74 @@ void setup() {
   if (err != CAM_ERR_SUCCESS) {
     printCameraError(err);
   }
-  while (!SD.begin()) {
-    Serial.println("Insert SD Card");
-  }
   theCamera.startStreaming(true, CamCB);
   theCamera.setStillPictureImageFormat(
-     CAM_IMGSIZE_QUADVGA_H,
-     CAM_IMGSIZE_QUADVGA_V,
+     CAM_IMGSIZE_QVGA_H,
+     CAM_IMGSIZE_QVGA_V,
      CAM_IMAGE_PIX_FMT_JPG);
+  init_gps();
+}
+
+void send_serial() {
+  if (savedSize > 0) {
+    while (sendingSerialMutex.Trylock() != 0) {}
+    SpNavData NavData;
+    Gnss.getNavData(&NavData);
+    print_pos(&NavData);
+    base64EncodeSerialWrite(savedBuff, savedSize);
+    sendingSerialMutex.Unlock();
+  } else {
+    Serial.println("image not found");
+  }
+  digitalWrite(LED0, LOW);
+  digitalWrite(LED1, LOW);
 }
 
 void loop() {
+  static int LoopCount = 0;
+  int inputchar = Serial.read();
+  if (inputchar != -1) {
+    if (inputchar == '>') {
+      LoopCount++;
+      digitalWrite(LED0, HIGH);
+      digitalWrite(LED1, HIGH);
+      send_serial();
+    }
+  }
+
+  if (LoopCount >= RESTART_CYCLE)
+  {
+    int error_flag = 0;
+
+    /* Restart GNSS. */
+    if (Gnss.stop() != 0)
+    {
+      Serial.println("Gnss stop error!!");
+      error_flag = 1;
+    }
+    else if (Gnss.end() != 0)
+    {
+      Serial.println("Gnss end error!!");
+      error_flag = 1;
+    }
+
+    if (Gnss.begin() != 0)
+    {
+      Serial.println("Gnss begin error!!");
+      error_flag = 1;
+    }
+    else if (Gnss.start(HOT_START) != 0)
+    {
+      Serial.println("Gnss start error!!");
+      error_flag = 1;
+    }
+
+    LoopCount = 0;
+
+    /* Set error LED. */
+    if (error_flag == 1)
+    {
+      exit(0);
+    }
+  }
 }
