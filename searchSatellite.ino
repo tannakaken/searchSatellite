@@ -2,6 +2,7 @@
 #include <Camera.h>
 #include <SDHCI.h>
 #include <GNSS.h>
+#include <LowPower.h>
 #include <MPMutex.h>
 // https://github.com/TE-YoshinoriOota/Spresense-LowPower-EdgeAI/tree/main/Libraries からzipをダウンロードしてarduion IDEの機能でインストールする
 #include "Adafruit_ILI9341.h"
@@ -38,8 +39,8 @@ enum ParamSat {
 };
 
 /* Set this parameter depending on your current region. */
-static enum ParamSat satType =  eSatGps;
-
+// static enum ParamSat satType =  eSatGps;
+static enum ParamSat satType =  eSatGpsQz1cQz1S; // みちびきとの接続
 static void init_gps() {
   int error_flag = 0;
   /* Activate GNSS device */
@@ -128,6 +129,8 @@ static void init_gps() {
 }
 
 /**
+ * 
+ * シリアルに毎回接続する仕方だと必ず失敗する。
  * @brief %Print position information.
  */
 static void print_pos(SpNavData *pNavData)
@@ -248,6 +251,9 @@ void printCameraError(enum CamErr err) {
 // CamImage savedImg; これ二つあるとなぜかうまくいかない。
 uint8_t *savedBuff = NULL;
 size_t savedSize;
+// 撮影時のGPSデータ
+SpNavData NavData;
+// カメラのスレッドとloopのスレッドは別なのでロックしないと画像が混じる
 MPMutex sendingSerialMutex(MP_MUTEX_ID0);
 void takePhoto() {
   if (sendingSerialMutex.Trylock() != 0) {
@@ -264,6 +270,7 @@ void takePhoto() {
   savedSize = img.getImgSize();
   savedBuff = malloc(sizeof(uint8_t) * savedSize);
   memcpy(savedBuff, img.getImgBuff(), sizeof(uint8_t) * savedSize);
+  Gnss.getNavData(&NavData);
   sendingSerialMutex.Unlock();
 }
 
@@ -315,20 +322,43 @@ void setup() {
     printCameraError(err);
   }
   theCamera.startStreaming(true, CamCB);
+  // 画像が大きすぎると送信に時間がかかる
   theCamera.setStillPictureImageFormat(
      CAM_IMGSIZE_QVGA_H,
      CAM_IMGSIZE_QVGA_V,
      CAM_IMAGE_PIX_FMT_JPG);
   init_gps();
+  LowPower.begin();
+}
+
+#define LIST_LENGTH 100
+int list[LIST_LENGTH];
+int head = 0;
+void push(int val) {
+  list[head] = val;
+  head = (head + 1) % LIST_LENGTH;
+}
+
+int decrement(int i) {
+  return i == 0 ? LIST_LENGTH - 1 : i - 1;
+}
+
+void sendList() {
+  for (int i = decrement(head); i != head; i = decrement(i)) {
+    Serial.print(list[i]);
+    Serial.print(",");
+  }
+  Serial.print("\n");
 }
 
 void send_serial() {
   if (savedSize > 0) {
+    // カメラのスレッドとloopのスレッドは別
+    // なので送信時にロックしないと画像が混じる
     while (sendingSerialMutex.Trylock() != 0) {}
-    SpNavData NavData;
-    Gnss.getNavData(&NavData);
     print_pos(&NavData);
     base64EncodeSerialWrite(savedBuff, savedSize);
+    sendList();
     sendingSerialMutex.Unlock();
   } else {
     Serial.println("image not found");
@@ -348,7 +378,8 @@ void loop() {
       send_serial();
     }
   }
-
+  push(LowPower.getVoltage());
+  
   if (LoopCount >= RESTART_CYCLE)
   {
     int error_flag = 0;
